@@ -26,17 +26,17 @@ class PlantHealthDetector:
     """
     
     def __init__(self):
-        # Thresholds determined from analyzing healthy vs unhealthy samples
-        # Based on empirical analysis of feature distributions
-        # Thresholds set between healthy and unhealthy means for better separation
+        # Thresholds optimized via grid search on balanced dataset (78 healthy, 78 unhealthy)
+        # Achieves ~81% overall accuracy with balanced healthy/unhealthy detection
         self.thresholds = {
-            'green_ratio_min': 0.90,           # Healthy: ~0.95, Unhealthy: ~0.76
-            'brown_spot_ratio_max': 0.02,      # Healthy: ~0.008, Unhealthy: ~0.077
-            'yellow_ratio_max': 0.07,          # Healthy: ~0.045, Unhealthy: ~0.213
-            'disease_ratio_max': 0.09,         # Healthy: ~0.08, Unhealthy: ~0.20
-            'excess_green_min': 58,            # Healthy: ~64, Unhealthy: ~51
-            'hue_std_max': 12,                 # High hue std indicates color variation (disease)
+            'green_ratio_min': 0.90,           # Healthy: ~0.96, Unhealthy: ~0.69
+            'brown_spot_ratio_max': 0.02,      # Healthy: ~0.007, Unhealthy: ~0.107
+            'yellow_ratio_max': 0.08,          # Healthy: ~0.042, Unhealthy: ~0.275
+            'disease_ratio_max': 0.12,         # Healthy: ~0.10, Unhealthy: ~0.37
+            'excess_green_min': 65,            # Healthy: ~66, Unhealthy: ~50
+            'hue_std_max': 7.5,                # Healthy: ~6.5, Unhealthy: ~11.5
         }
+        self.health_score_threshold = 85      # Classification threshold
         
     def load_image(self, image_path):
         """Load and validate image."""
@@ -456,10 +456,11 @@ class PlantHealthDetector:
         # Ensure score is within bounds
         health_score = max(0, min(100, health_score))
         
-        # Classification with threshold at 75
-        if health_score >= 75:
+        # Classification using optimized threshold
+        threshold = self.health_score_threshold
+        if health_score >= threshold:
             classification = "HEALTHY"
-        elif health_score >= 50:
+        elif health_score >= threshold - 25:
             classification = "UNHEALTHY (Mild)"
         else:
             classification = "UNHEALTHY (Severe)"
@@ -467,7 +468,7 @@ class PlantHealthDetector:
         return {
             'classification': classification,
             'health_score': health_score,
-            'is_healthy': health_score >= 75,
+            'is_healthy': health_score >= threshold,
             'reasons': reasons if reasons else ["Leaf appears healthy"]
         }
     
@@ -580,14 +581,22 @@ class PlantHealthDetector:
         return fig
 
 
-def evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=None):
+def evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=None, show_confusion_matrix=True, title="Evaluation"):
     """
     Evaluate the detector on a dataset and calculate accuracy.
+    Returns results including confusion matrix data.
     """
     results = {
         'healthy': {'correct': 0, 'total': 0, 'predictions': []},
         'unhealthy': {'correct': 0, 'total': 0, 'predictions': []}
     }
+    
+    # For confusion matrix: [actual][predicted]
+    # TP = healthy predicted as healthy
+    # TN = unhealthy predicted as unhealthy  
+    # FP = unhealthy predicted as healthy
+    # FN = healthy predicted as unhealthy
+    confusion = {'TP': 0, 'TN': 0, 'FP': 0, 'FN': 0}
     
     # Process healthy images
     healthy_files = [f for f in os.listdir(healthy_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
@@ -599,12 +608,18 @@ def evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=None):
         try:
             filepath = os.path.join(healthy_dir, filename)
             analysis = detector.analyze_image(filepath)
-            is_correct = analysis['result']['is_healthy']
-            results['healthy']['correct'] += int(is_correct)
+            predicted_healthy = analysis['result']['is_healthy']
+            
+            if predicted_healthy:
+                confusion['TP'] += 1  # True Positive (healthy correctly identified)
+            else:
+                confusion['FN'] += 1  # False Negative (healthy misclassified as unhealthy)
+            
+            results['healthy']['correct'] += int(predicted_healthy)
             results['healthy']['total'] += 1
             results['healthy']['predictions'].append({
                 'file': filename,
-                'correct': is_correct,
+                'correct': predicted_healthy,
                 'score': analysis['result']['health_score']
             })
             
@@ -623,12 +638,18 @@ def evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=None):
         try:
             filepath = os.path.join(unhealthy_dir, filename)
             analysis = detector.analyze_image(filepath)
-            is_correct = not analysis['result']['is_healthy']
-            results['unhealthy']['correct'] += int(is_correct)
+            predicted_healthy = analysis['result']['is_healthy']
+            
+            if not predicted_healthy:
+                confusion['TN'] += 1  # True Negative (unhealthy correctly identified)
+            else:
+                confusion['FP'] += 1  # False Positive (unhealthy misclassified as healthy)
+            
+            results['unhealthy']['correct'] += int(not predicted_healthy)
             results['unhealthy']['total'] += 1
             results['unhealthy']['predictions'].append({
                 'file': filename,
-                'correct': is_correct,
+                'correct': not predicted_healthy,
                 'score': analysis['result']['health_score']
             })
             
@@ -636,6 +657,9 @@ def evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=None):
                 print(f"  Processed {i + 1}/{len(unhealthy_files)}")
         except Exception as e:
             print(f"  Error processing {filename}: {e}")
+    
+    # Store confusion matrix
+    results['confusion'] = confusion
     
     # Calculate metrics
     total_correct = results['healthy']['correct'] + results['unhealthy']['correct']
@@ -645,15 +669,99 @@ def evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=None):
     unhealthy_accuracy = results['unhealthy']['correct'] / results['unhealthy']['total'] * 100 if results['unhealthy']['total'] > 0 else 0
     overall_accuracy = total_correct / total_samples * 100 if total_samples > 0 else 0
     
+    # Calculate additional metrics
+    precision = confusion['TP'] / (confusion['TP'] + confusion['FP']) if (confusion['TP'] + confusion['FP']) > 0 else 0
+    recall = confusion['TP'] / (confusion['TP'] + confusion['FN']) if (confusion['TP'] + confusion['FN']) > 0 else 0
+    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
     print("\n" + "="*60)
     print("EVALUATION RESULTS")
     print("="*60)
     print(f"\nHealthy Detection Accuracy:   {healthy_accuracy:.1f}% ({results['healthy']['correct']}/{results['healthy']['total']})")
     print(f"Unhealthy Detection Accuracy: {unhealthy_accuracy:.1f}% ({results['unhealthy']['correct']}/{results['unhealthy']['total']})")
     print(f"\nOverall Accuracy: {overall_accuracy:.1f}% ({total_correct}/{total_samples})")
+    print(f"\nPrecision: {precision:.2f}")
+    print(f"Recall: {recall:.2f}")
+    print(f"F1-Score: {f1_score:.2f}")
     print("="*60)
     
+    # Show confusion matrix
+    if show_confusion_matrix:
+        plot_confusion_matrix(confusion, title=title, 
+                             total_healthy=results['healthy']['total'],
+                             total_unhealthy=results['unhealthy']['total'])
+    
     return results
+
+
+def plot_confusion_matrix(confusion, title="Confusion Matrix", total_healthy=0, total_unhealthy=0):
+    """
+    Plot confusion matrix visualization.
+    """
+    # Create confusion matrix array
+    # Rows: Actual (Healthy, Unhealthy)
+    # Cols: Predicted (Healthy, Unhealthy)
+    cm = np.array([
+        [confusion['TP'], confusion['FN']],  # Actual Healthy
+        [confusion['FP'], confusion['TN']]   # Actual Unhealthy
+    ])
+    
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Create heatmap
+    im = ax.imshow(cm, interpolation='nearest', cmap='Blues')
+    ax.figure.colorbar(im, ax=ax)
+    
+    # Labels
+    classes = ['Healthy', 'Unhealthy']
+    ax.set(xticks=np.arange(cm.shape[1]),
+           yticks=np.arange(cm.shape[0]),
+           xticklabels=classes, yticklabels=classes,
+           title=title,
+           ylabel='Actual Label',
+           xlabel='Predicted Label')
+    
+    # Rotate x labels
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    
+    # Add text annotations
+    thresh = cm.max() / 2.
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            # Calculate percentage
+            if i == 0:  # Actual Healthy
+                pct = cm[i, j] / total_healthy * 100 if total_healthy > 0 else 0
+            else:  # Actual Unhealthy
+                pct = cm[i, j] / total_unhealthy * 100 if total_unhealthy > 0 else 0
+            
+            ax.text(j, i, f'{cm[i, j]}\n({pct:.1f}%)',
+                   ha="center", va="center",
+                   color="white" if cm[i, j] > thresh else "black",
+                   fontsize=14, fontweight='bold')
+    
+    # Add labels for TP, TN, FP, FN
+    labels = [['TP\n(True Positive)', 'FN\n(False Negative)'],
+              ['FP\n(False Positive)', 'TN\n(True Negative)']]
+    
+    for i in range(2):
+        for j in range(2):
+            ax.text(j, i + 0.35, labels[i][j],
+                   ha="center", va="center",
+                   color="white" if cm[i, j] > thresh else "gray",
+                   fontsize=8)
+    
+    # Calculate and display metrics
+    total = cm.sum()
+    accuracy = (confusion['TP'] + confusion['TN']) / total * 100 if total > 0 else 0
+    
+    metrics_text = f"Accuracy: {accuracy:.1f}%"
+    plt.figtext(0.5, 0.02, metrics_text, ha='center', fontsize=12, fontweight='bold')
+    
+    plt.tight_layout()
+    plt.subplots_adjust(bottom=0.15)
+    plt.show()
+    
+    return fig
 
 
 def main():
@@ -673,18 +781,23 @@ def main():
     healthy_dir = os.path.join(base_dir, "healthy")
     unhealthy_dir = os.path.join(base_dir, "unhealthy")
     
+    # Test set paths
+    healthy_test_dir = os.path.join(base_dir, "healthy_test")
+    unhealthy_test_dir = os.path.join(base_dir, "unhealthy_test")
+    
     # Interactive menu
     while True:
         print("\n" + "-"*40)
         print("OPTIONS:")
         print("1. Analyze a single image")
-        print("2. Evaluate on sample dataset")
-        print("3. Evaluate on full dataset")
-        print("4. Compare healthy vs unhealthy sample")
-        print("5. Exit")
+        print("2. Evaluate on sample (30+30) - TRAINING")
+        print("3. Evaluate on full (78+78) - TRAINING")
+        print("4. Evaluate on TEST SET (30+30) - UNSEEN")
+        print("5. Compare healthy vs unhealthy sample")
+        print("6. Exit")
         print("-"*40)
         
-        choice = input("Enter your choice (1-5): ").strip()
+        choice = input("Enter your choice (1-6): ").strip()
         
         if choice == "1":
             print("\nAvailable directories:")
@@ -707,14 +820,28 @@ def main():
                 print(f"Error: File not found: {image_path}")
         
         elif choice == "2":
-            print("\nEvaluating on sample (20 images per class)...")
-            evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=20)
+            print("\nEvaluating on sample (30 images per class) - TRAINING SET...")
+            evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=30, 
+                           title="Training Sample (30+30)")
         
         elif choice == "3":
-            print("\nEvaluating on full dataset...")
-            evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=None)
+            print("\nEvaluating on full TRAINING dataset...")
+            evaluate_dataset(detector, healthy_dir, unhealthy_dir, sample_size=None,
+                           title="Full Training Set (78+78)")
         
         elif choice == "4":
+            print("\n" + "="*60)
+            print("TEST SET EVALUATION (Unseen Data)")
+            print("="*60)
+            if os.path.exists(healthy_test_dir) and os.path.exists(unhealthy_test_dir):
+                evaluate_dataset(detector, healthy_test_dir, unhealthy_test_dir, sample_size=None,
+                               title="Test Set - Unseen Data (30+30)")
+            else:
+                print("Error: Test directories not found!")
+                print(f"  Expected: {healthy_test_dir}")
+                print(f"  Expected: {unhealthy_test_dir}")
+        
+        elif choice == "5":
             # Get first healthy and unhealthy sample
             healthy_files = os.listdir(healthy_dir)
             unhealthy_files = os.listdir(unhealthy_dir)
@@ -752,7 +879,7 @@ def main():
                 plt.tight_layout()
                 plt.show()
         
-        elif choice == "5":
+        elif choice == "6":
             print("\nGoodbye!")
             break
         
